@@ -12,7 +12,25 @@ The app goes online exactly once, to download the model. After that you can put 
 - **20-step DPM-Solver++** (with Karras spacing for SDXL) gets good results in far fewer steps than the classic 50.
 - The first launch after download compiles the model for your exact chip. iOS caches that, so it's slow once and fast after.
 
-## Install from a Windows PC (no Mac needed)
+## Install with TestFlight (paid Apple Developer account)
+
+With a paid developer account, every push to `main` signs the app and uploads it to TestFlight (`.github/workflows/testflight.yml`). You install and update it from the TestFlight app on your iPhone, and it doesn't expire after 7 days (each TestFlight build lasts 90 days, and a new push makes a new build).
+
+One-time setup, all from a web browser:
+
+1. **Register the app ID.** At developer.apple.com → Account → Certificates, IDs & Profiles → Identifiers → **+** → App IDs → App. Description `Image Machine`, Bundle ID **Explicit** `com.subtlehustle.imagemachine`. Under Capabilities tick **Increased Memory Limit**. Continue → Register.
+2. **Create the app record.** At appstoreconnect.apple.com → Apps → **+** → New App. Platform iOS, any name (it must be unique on the App Store, e.g. `Image Machine Don`), language English, Bundle ID `com.subtlehustle.imagemachine`, SKU `imagemachine`, Full Access. Create.
+3. **Make an API key.** App Store Connect → Users and Access → Integrations → App Store Connect API → Team Keys → **+**. Name `GitHub`, access **Admin**, Generate. Note the **Issuer ID** (above the table) and the **Key ID**, then click **Download** to get `AuthKey_XXXX.p8`. You can only download it once.
+4. **Find your Team ID.** developer.apple.com → Account → Membership details → Team ID (10 characters).
+5. **Add four GitHub secrets.** In the repository on github.com → Settings → Secrets and variables → Actions → **New repository secret**, add:
+   - `APPLE_TEAM_ID`: your Team ID
+   - `ASC_KEY_ID`: the Key ID
+   - `ASC_ISSUER_ID`: the Issuer ID
+   - `ASC_KEY_P8`: open the .p8 file in Notepad and paste everything, including the BEGIN and END lines
+6. **Run it.** Actions → Upload to TestFlight → Run workflow. When it's green, Apple processes the build for a few minutes.
+7. **Install.** App Store Connect → your app → TestFlight → Internal Testing → **+** to make a group, add yourself, and add the build. On the iPhone, install **TestFlight** from the App Store, sign in with the same Apple ID, and tap **Install** on Image Machine.
+
+## Install from a Windows PC with Sideloadly (free Apple ID)
 
 Every push to `main` builds `ImageMachine.ipa` on a GitHub cloud Mac (Actions tab → latest "Build iPhone app" run → Artifacts). You install that file with **Sideloadly**, which signs it with your own Apple ID.
 
