@@ -26,7 +26,7 @@ final class Generator: ObservableObject {
         config.guidanceScale = Float(guidance)
         config.seed = seed ?? UInt32.random(in: 0...UInt32.max)
         config.schedulerType = .dpmSolverMultistepScheduler
-        config.disableSafety = false
+        config.disableSafety = true
         if box.isXL {
             // SDXL's VAE uses a different latent scale, and its sampler does
             // better with Karras spacing at low step counts.
@@ -49,7 +49,7 @@ final class Generator: ObservableObject {
                     return !(self?.isCancelledSnapshot ?? false)
                 }
                 let first = images.first ?? nil
-                await self?.finish(image: first, flagged: first == nil)
+                await self?.finish(image: first)
             } catch {
                 await self?.finish(error: error)
             }
@@ -62,14 +62,14 @@ final class Generator: ObservableObject {
     private let cancelledFlag = AtomicFlag()
     nonisolated var isCancelledSnapshot: Bool { cancelledFlag.get() }
 
-    private func finish(image: CGImage?, flagged: Bool) {
+    private func finish(image: CGImage?) {
         isRunning = false
         if cancelledFlag.get() {
             message = "Stopped."
-        } else if flagged {
-            message = "The built-in safety filter blocked this image. Try a different prompt or seed."
-        } else {
+        } else if let image {
             self.image = image
+        } else {
+            message = "No image came back. Try again."
         }
     }
 

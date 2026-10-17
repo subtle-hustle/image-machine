@@ -154,7 +154,8 @@ final class ModelManager: ObservableObject {
                         resourcesAt: folder,
                         controlNet: [],
                         configuration: config,
-                        disableSafety: false,
+                        // No safety checker: it isn't loaded, so it costs no memory or time.
+                        disableSafety: true,
                         reduceMemory: reduceMemory
                     )
                 }

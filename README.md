@@ -70,7 +70,7 @@ AirDrop it to the phone (it lands in Files), then tap **Import model .zip from F
 - **Seed**: leave blank for a new image each time, or tap **Reuse** to keep a composition and tweak the prompt.
 - **Save to Photos** or **Share** the result.
 
-SD 2.1 includes Stable Diffusion's standard safety filter; if it flags an image, the app tells you instead of showing it. Apple's SDXL build ships without one.
+The app doesn't run Stable Diffusion's safety filter on either model, so nothing gets blanked out. It also skips loading the filter, which saves memory and time.
 
 To switch models, tap **Delete model** at the bottom and download the other one.
 
