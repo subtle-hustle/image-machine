@@ -1,0 +1,42 @@
+name: Build iPhone app
+
+# Builds an unsigned ImageMachine.ipa on a GitHub macOS runner.
+# Sideloadly (Windows) signs it with your Apple ID when it installs it on the phone.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the newest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+
+      - name: Build
+        run: |
+          xcodebuild \
+            -project ImageMachine.xcodeproj \
+            -scheme ImageMachine \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package .ipa
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/ImageMachine.app Payload/
+          zip -qr ImageMachine.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ImageMachine-ipa
+          path: ImageMachine.ipa
