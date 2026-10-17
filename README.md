@@ -12,14 +12,32 @@ The app goes online exactly once, to download the model. After that you can put 
 - **20-step DPM-Solver++** (with Karras spacing for SDXL) gets good results in far fewer steps than the classic 50.
 - The first launch after download compiles the model for your exact chip. iOS caches that, so it's slow once and fast after.
 
-## What you need
+## Install from a Windows PC (no Mac needed)
+
+Every push to `main` builds `ImageMachine.ipa` on a GitHub cloud Mac (Actions tab → latest "Build iPhone app" run → Artifacts). You install that file with **Sideloadly**, which signs it with your own Apple ID.
+
+1. On the PC, install **iTunes** and **iCloud** from apple.com (the downloads from Apple's site, not the Microsoft Store versions). Sideloadly needs them to talk to the iPhone.
+2. Install **Sideloadly** from sideloadly.io.
+3. Connect the iPhone with a USB cable, unlock it, and tap **Trust**.
+4. Open Sideloadly. Drag `ImageMachine.ipa` onto it, type your Apple ID email in the Apple account box, and click **Start**. Enter your Apple ID password and the 6-digit code if it asks. It finishes in about a minute.
+5. On the iPhone, turn on **Settings → Privacy & Security → Developer Mode** and let it restart. Unlock it and tap **Turn On**.
+6. Open **Settings → General → VPN & Device Management**, tap your Apple ID, and tap **Trust**.
+7. Open Image Machine, connect to Wi-Fi, and tap **Download**. After that it works offline.
+
+With a free Apple ID the app stops opening after 7 days. Plug the phone in and repeat step 4; your model and settings stay on the phone.
+
+The cloud build is unsigned and leaves out the Increased Memory Limit entitlement (a free Apple ID can't use it). The app checks how much memory iOS gives it and loads the model in pieces if it needs to.
+
+## Building with Xcode on a Mac instead
+
+### What you need
 
 - A Mac with **Xcode 16 or newer** (free from the Mac App Store)
 - An iPhone or iPad on **iOS 17 or newer**. SDXL needs 8 GB of RAM (iPhone 15 Pro or any iPhone 16); SD 2.1 runs on iPhone 12 and later.
 - About **6 GB free** on the phone during setup for SDXL (3 GB for SD 2.1); the zip is deleted after unpacking.
 - A free Apple ID is enough. With a free account the app stops opening after 7 days and you just build it again; a paid developer account ($99/yr) makes that a year.
 
-## Build it onto your phone
+### Build it onto your phone
 
 1. Copy the `ImageMachine` folder to your Mac and double-click `ImageMachine.xcodeproj`.
 2. Wait for Xcode to fetch the two packages (ml-stable-diffusion and ZIPFoundation). You'll see "Resolving packages" at the top of the window.
