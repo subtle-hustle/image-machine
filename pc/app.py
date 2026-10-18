@@ -202,7 +202,7 @@ def load_pipe(choice, progress):
         pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
     pipe.set_progress_bar_config(disable=True)
     pipe.to(DEVICE)
-    pipe.enable_vae_tiling()
+    pipe.vae.enable_tiling()
     _pipe, _pipe_key = pipe, choice
     return pipe
 
