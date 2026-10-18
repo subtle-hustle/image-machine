@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +23,7 @@ for d in (MODELS_DIR, CUSTOM_DIR, OUTPUTS_DIR):
 
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "hf"))
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
 import gradio as gr  # noqa: E402
@@ -97,24 +99,93 @@ def model_choices():
     return list(BUILTIN_MODELS) + [f"Custom: {c}" for c in customs]
 
 
-def load_pipe(choice):
+HF = "https://huggingface.co"
+WEIGHT_DIRS = ("unet", "vae", "text_encoder")
+
+
+def _http_json(url):
+    with urllib.request.urlopen(url, timeout=60) as r:
+        return json.load(r)
+
+
+def _download(url, dest, size, report):
+    """Plain resumable download. huggingface_hub's own downloader stalls on some networks."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and (size is None or dest.stat().st_size == size):
+        return
+    part = dest.with_name(dest.name + ".part")
+    for _attempt in range(5):
+        have = part.stat().st_size if part.exists() else 0
+        req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
+                while chunk := r.read(1 << 20):
+                    f.write(chunk)
+                    have += len(chunk)
+                    report(have)
+            break
+        except OSError:
+            time.sleep(3)
+    if size is not None and part.stat().st_size != size:
+        raise gr.Error("The model download was interrupted. Check your internet and try again.")
+    part.replace(dest)
+
+
+def fetch_model(repo, progress):
+    """Download a diffusers model once into models/<name>. Returns (folder, variant)."""
+    folder = MODELS_DIR / repo.split("/")[-1]
+    marker = folder / ".complete"
+    if marker.exists():
+        return folder, marker.read_text().strip() or None
+    try:
+        info = _http_json(f"{HF}/api/models/{repo}?blobs=true")
+    except OSError:
+        raise gr.Error("This model isn't downloaded yet and there's no internet connection.") from None
+    files = {s["rfilename"]: s.get("size") for s in info["siblings"]}
+    variant = "fp16" if all(f"{d}/{'model' if d == 'text_encoder' else 'diffusion_pytorch_model'}.fp16.safetensors"
+                            in files for d in WEIGHT_DIRS) else None
+    want = []
+    for name, size in files.items():
+        top = name.split("/")[0]
+        if name == "model_index.json" or (top in ("scheduler", "tokenizer", "feature_extractor")):
+            want.append((name, size))
+        elif top in WEIGHT_DIRS:
+            if name.endswith("config.json"):
+                want.append((name, size))
+            elif name.endswith(".fp16.safetensors" if variant else ".safetensors") and \
+                    (variant or name.count(".") == 1):
+                want.append((name, size))
+    total = sum(s or 0 for _, s in want) or 1
+    done = 0
+    for name, size in want:
+        base = done
+        _download(f"{HF}/{repo}/resolve/main/{name}", folder / name, size,
+                  lambda n, base=base: progress((base + n) / total,
+                                                desc=f"Downloading model once: {(base + n) / 2**30:.1f} of {total / 2**30:.1f} GB"))
+        done += size or 0
+    marker.write_text(variant or "")
+    return folder, variant
+
+
+def load_pipe(choice, progress):
     global _pipe, _pipe_key
     if _pipe is not None and _pipe_key == choice:
         return _pipe
     _pipe = None
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
-    kwargs = dict(torch_dtype=DTYPE, safety_checker=None, requires_safety_checker=False)
+    kwargs = dict(torch_dtype=DTYPE, safety_checker=None, feature_extractor=None,
+                  requires_safety_checker=False)
     if choice.startswith("Custom: "):
         path = CUSTOM_DIR / choice[len("Custom: "):]
-        pipe = StableDiffusionPipeline.from_single_file(str(path), **kwargs)
+        # Single-file checkpoints borrow their layout from DreamShaper, so they also load offline.
+        folder, _ = fetch_model(BUILTIN_MODELS[DEFAULT_MODEL], progress)
+        progress(0, desc="Loading model…")
+        pipe = StableDiffusionPipeline.from_single_file(str(path), config=str(folder), **kwargs)
     else:
-        repo = BUILTIN_MODELS[choice]
-        try:
-            pipe = StableDiffusionPipeline.from_pretrained(repo, local_files_only=True, **kwargs)
-        except Exception:
-            gr.Info("Downloading this model once (about 2 to 4 GB). After that it works offline.")
-            pipe = StableDiffusionPipeline.from_pretrained(repo, **kwargs)
+        folder, variant = fetch_model(BUILTIN_MODELS[choice], progress)
+        progress(0, desc="Loading model…")
+        pipe = StableDiffusionPipeline.from_pretrained(str(folder), variant=variant, **kwargs)
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(
         pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
     pipe.set_progress_bar_config(disable=True)
@@ -132,7 +203,7 @@ def generate(prompt, negative, style, size, model, steps, cfg, seed, count, prog
         raise gr.Error("That prompt can't be generated.")
 
     progress(0, desc="Loading model…")
-    pipe = load_pipe(model)
+    pipe = load_pipe(model, progress)
     style_pos, style_neg = STYLES.get(style, ("", ""))
     full_prompt = f"{prompt}, {style_pos}" if style_pos else prompt
     full_negative = ", ".join(x for x in (negative.strip(), style_neg, BASE_NEGATIVE) if x)
