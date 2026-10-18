@@ -4,6 +4,7 @@ Runs Stable Diffusion 1.5-family models locally with diffusers and a Gradio UI.
 After the first model download, everything works without an internet connection.
 """
 
+import gc
 import json
 import os
 import random
@@ -205,6 +206,7 @@ def load_pipe(choice, progress):
     if _pipe is not None and _pipe_key == choice:
         return _pipe
     _pipe = None
+    gc.collect()  # free the previous model's RAM before loading the next one
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
     kwargs = dict(torch_dtype=DTYPE, safety_checker=None, feature_extractor=None,
@@ -450,7 +452,7 @@ with gr.Blocks(title="Image Machine", theme=theme, css=CSS, js=FORCE_DARK) as de
                                              placeholder="a red leather jacket")
                     edit_mode = gr.Radio([EDIT_AREA, EDIT_WHOLE], value=EDIT_AREA, label="What to change")
                     edit_quality = gr.Radio([EDIT_BEST, EDIT_FAST], value=EDIT_BEST, label="Quality")
-                    edit_strength = gr.Slider(0.2, 1.0, value=0.9, step=0.05, label="How much to change",
+                    edit_strength = gr.Slider(0.2, 1.0, value=1.0, step=0.05, label="How much to change",
                                               info="Low keeps more of the original, high redraws more")
                     edit_seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
                     edit_go = gr.Button("Apply edit", variant="primary", elem_id="go2")
@@ -480,7 +482,7 @@ with gr.Blocks(title="Image Machine", theme=theme, css=CSS, js=FORCE_DARK) as de
 
     gallery.select(pick, None, picked)
     to_edit.click(send_to_edit, picked, [editor, tabs])
-    edit_mode.change(lambda m: 0.9 if m == EDIT_AREA else 0.5, edit_mode, edit_strength)
+    edit_mode.change(lambda m: 1.0 if m == EDIT_AREA else 0.5, edit_mode, edit_strength)
     edit_go.click(edit, [editor, edit_prompt, edit_mode, edit_quality, edit_strength, edit_seed],
                   [edit_result, edit_status])
     keep.click(lambda p: send_to_edit(p)[0] if p else gr.update(), edit_result, editor)
