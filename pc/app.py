@@ -451,7 +451,9 @@ with gr.Blocks(title="Image Machine", theme=theme, css=CSS, js=FORCE_DARK) as de
                     edit_prompt = gr.Textbox(label="What should it show?", lines=3,
                                              placeholder="a red leather jacket")
                     edit_mode = gr.Radio([EDIT_AREA, EDIT_WHOLE], value=EDIT_AREA, label="What to change")
-                    edit_quality = gr.Radio([EDIT_BEST, EDIT_FAST], value=EDIT_BEST, label="Quality")
+                    edit_quality = gr.Radio([EDIT_FAST, EDIT_BEST], value=EDIT_FAST, label="Quality",
+                                            info="Best works better when you describe the whole picture, "
+                                                 "not just the change")
                     edit_strength = gr.Slider(0.2, 1.0, value=1.0, step=0.05, label="How much to change",
                                               info="Low keeps more of the original, high redraws more")
                     edit_seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
