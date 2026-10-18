@@ -159,7 +159,10 @@ def fetch_model(repo, progress):
     want = []
     for name, size in files.items():
         top = name.split("/")[0]
-        if name == "model_index.json" or (top in ("scheduler", "tokenizer", "feature_extractor")):
+        if "unet/config.json" not in files:  # not an SD 1.5 layout: take every model file
+            if top != "assets" and not name.endswith((".md", ".gitattributes", ".png", ".jpg", ".webp")):
+                want.append((name, size))
+        elif name == "model_index.json" or (top in ("scheduler", "tokenizer", "feature_extractor")):
             want.append((name, size))
         elif top in WEIGHT_DIRS:
             if name.endswith("config.json"):
