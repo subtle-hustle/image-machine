@@ -28,7 +28,13 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
 import gradio as gr  # noqa: E402
 import torch  # noqa: E402
-from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline  # noqa: E402
+from diffusers import (  # noqa: E402
+    DPMSolverMultistepScheduler,
+    StableDiffusionImg2ImgPipeline,
+    StableDiffusionInpaintPipeline,
+    StableDiffusionPipeline,
+)
+from PIL import Image, ImageFilter  # noqa: E402
 from PIL.PngImagePlugin import PngInfo  # noqa: E402
 
 ZIMAGE = "Z-Image Turbo (best quality, slower)"
@@ -41,6 +47,9 @@ BUILTIN_MODELS = {
 DEFAULT_MODEL = ZIMAGE
 SD_LAYOUT_MODEL = "DreamShaper 8 (all-rounder)"
 ZIMAGE_STEPS = 8
+# Not in the model list: the fast edit mode's dedicated inpainting model.
+INPAINT_MODEL = "DreamShaper 8 inpainting"
+INPAINT_REPO = "Lykon/dreamshaper-8-inpainting"
 
 # Pixel sizes per shape. Z-Image gets a little more room; every shape costs about
 # the same time (roughly 1.5 to 2 minutes per picture on a GTX 1660 Ti).
@@ -212,9 +221,11 @@ def load_pipe(choice, progress):
         _pipe, _pipe_key = load_zimage(folder), choice
         return _pipe
     else:
-        folder, variant = fetch_model(BUILTIN_MODELS[choice], progress)
+        repo = INPAINT_REPO if choice == INPAINT_MODEL else BUILTIN_MODELS[choice]
+        cls = StableDiffusionInpaintPipeline if choice == INPAINT_MODEL else StableDiffusionPipeline
+        folder, variant = fetch_model(repo, progress)
         progress(0, desc="Loading model…")
-        pipe = StableDiffusionPipeline.from_pretrained(str(folder), variant=variant, **kwargs)
+        pipe = cls.from_pretrained(str(folder), variant=variant, **kwargs)
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(
         pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
     pipe.set_progress_bar_config(disable=True)
@@ -286,6 +297,83 @@ def generate(prompt, negative, style, size, model, steps, cfg, seed, count, prog
     return images, status, base_seed
 
 
+EDIT_AREA = "Change the painted area"
+EDIT_WHOLE = "Vary the whole picture"
+EDIT_BEST = "Best (Z-Image, about 1.5 min)"
+EDIT_FAST = "Fast (DreamShaper, about 20 s)"
+
+
+def fit_size(img, area, multiple):
+    """Scale to roughly `area` pixels, keeping the shape, in sizes the model accepts."""
+    scale = (area / (img.width * img.height)) ** 0.5
+    return (max(multiple, round(img.width * scale / multiple) * multiple),
+            max(multiple, round(img.height * scale / multiple) * multiple))
+
+
+def save_output(img, meta):
+    info = PngInfo()
+    info.add_text("parameters", json.dumps(meta))
+    path = OUTPUTS_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{meta['seed']}.png"
+    img.save(path, pnginfo=info)
+    return str(path)
+
+
+def edit(editor, prompt, mode, quality, strength, seed, progress=gr.Progress()):
+    if not editor or editor.get("background") is None:
+        raise gr.Error("Add a picture first: upload one, or press \"Edit this picture\" on the Create tab.")
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise gr.Error("Describe what the picture should show.")
+    if blocked(prompt):
+        raise gr.Error("That prompt can't be generated.")
+    original = editor["background"].convert("RGB")
+    mask = None
+    if mode == EDIT_AREA:
+        mask = Image.new("L", original.size, 0)
+        for layer in editor.get("layers") or []:
+            mask = Image.composite(Image.new("L", original.size, 255), mask,
+                                   layer.convert("RGBA").getchannel("A").point(lambda a: 255 if a > 0 else 0))
+        if not mask.getbbox():
+            raise gr.Error("Paint over the part you want changed first (or pick \"Vary the whole picture\").")
+
+    best = quality == EDIT_BEST
+    s = int(seed) if seed is not None and int(seed) >= 0 else random.randint(0, 2**31 - 1)
+    gen = torch.Generator(DEVICE).manual_seed(s)
+    started = time.time()
+    progress(0, desc="Loading model…")
+    if best:
+        from diffusers import ZImageImg2ImgPipeline, ZImageInpaintPipeline
+
+        base = load_pipe(ZIMAGE, progress)
+        size = fit_size(original, 640 * 640, 16)
+        cls = ZImageInpaintPipeline if mask else ZImageImg2ImgPipeline
+        pipe = cls.from_pipe(base)
+        pipe.set_progress_bar_config(disable=True)
+        args = dict(num_inference_steps=ZIMAGE_STEPS, guidance_scale=0.0)
+    else:
+        size = fit_size(original, 512 * 512, 8)
+        if mask:
+            pipe = load_pipe(INPAINT_MODEL, progress)
+        else:
+            pipe = StableDiffusionImg2ImgPipeline.from_pipe(load_pipe(SD_LAYOUT_MODEL, progress))
+            pipe.set_progress_bar_config(disable=True)
+        args = dict(num_inference_steps=30, guidance_scale=7.0, negative_prompt=BASE_NEGATIVE)
+    progress(0.1, desc="Painting…")
+    image_in = original.resize(size, Image.LANCZOS)
+    extra = {"mask_image": mask.resize(size, Image.LANCZOS)} if mask else {}
+    if best or mask:  # SD img2img takes its size from the input picture instead
+        extra.update(width=size[0], height=size[1])
+    out = pipe(prompt, image=image_in, strength=float(strength), generator=gen, **extra, **args).images[0]
+    out = out.resize(original.size, Image.LANCZOS)
+    if mask:  # keep every unpainted pixel exactly as it was, with a soft seam
+        soft = mask.filter(ImageFilter.MaxFilter(9)).filter(ImageFilter.GaussianBlur(6))
+        out = Image.composite(out, original, soft)
+    path = save_output(out, {"prompt": prompt, "seed": s, "mode": mode, "strength": strength,
+                             "model": ZIMAGE if best else INPAINT_MODEL if mask else SD_LAYOUT_MODEL})
+    took = time.time() - started
+    return path, f"Done in {took:.0f}s · seed {s} · saved to outputs. Press \"Keep editing this\" to build on it."
+
+
 def open_outputs():
     if sys.platform == "win32":
         os.startfile(OUTPUTS_DIR)  # noqa: S606
@@ -304,7 +392,7 @@ CSS = """
 #title h1 {font-size: 1.9rem; font-weight: 700; letter-spacing: -0.02em; margin: 0;}
 #subtitle {opacity: .7; margin-top: 2px;}
 #prompt textarea {font-size: 1.05rem;}
-#go {min-height: 52px; font-size: 1.05rem; font-weight: 600;}
+#go, #go2 {min-height: 52px; font-size: 1.05rem; font-weight: 600;}
 #gallery {min-height: 560px;}
 footer {display: none !important;}
 """
@@ -317,40 +405,85 @@ FORCE_DARK = """() => { if (!document.body.classList.contains('dark')) document.
 with gr.Blocks(title="Image Machine", theme=theme, css=CSS, js=FORCE_DARK) as demo:
     gr.Markdown("# Image Machine", elem_id="title")
     gr.Markdown(f"Offline image generator · running on {DEVICE_LABEL}", elem_id="subtitle")
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=4, min_width=340):
-            prompt = gr.Textbox(label="Describe your image", lines=4, elem_id="prompt",
-                                placeholder="A lighthouse on a cliff at sunset, crashing waves, golden light")
-            with gr.Row():
-                style = gr.Dropdown(list(STYLES), value="None", label="Style")
-                size = gr.Dropdown(list(SIZES), value="Square", label="Shape")
-            count = gr.Slider(1, 4, value=1, step=1, label="How many images")
-            go = gr.Button("Generate", variant="primary", elem_id="go")
-            with gr.Accordion("More options", open=False):
-                negative = gr.Textbox(label="Leave out (SD 1.5 models only)", lines=2,
-                                      placeholder="things you don't want in the picture")
-                model = gr.Dropdown(model_choices(), value=DEFAULT_MODEL, label="Model",
-                                    info="Z-Image follows prompts and writes text best. The SD 1.5 models are "
-                                         "much faster. Drop SD 1.5 .safetensors files into models\\custom to add your own.")
-                steps = gr.Slider(10, 50, value=25, step=1, label="Steps (SD 1.5 models only)")
-                cfg = gr.Slider(1, 15, value=7, step=0.5, label="Prompt strength (SD 1.5 models only)")
-                seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
-                with gr.Row():
-                    refresh = gr.Button("Refresh model list", size="sm")
-                    reuse = gr.Button("Reuse last seed", size="sm")
-        with gr.Column(scale=6):
-            gallery = gr.Gallery(value=recent_images(), label="Results", columns=2, height=600,
-                                 object_fit="contain", elem_id="gallery", show_download_button=True)
-            status = gr.Markdown("Ready.")
-            folder = gr.Button("Open outputs folder", size="sm")
+    with gr.Tabs() as tabs:
+        with gr.Tab("Create", id="create"):
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=4, min_width=340):
+                    prompt = gr.Textbox(label="Describe your image", lines=4, elem_id="prompt",
+                                        placeholder="A lighthouse on a cliff at sunset, crashing waves, golden light")
+                    with gr.Row():
+                        style = gr.Dropdown(list(STYLES), value="None", label="Style")
+                        size = gr.Dropdown(list(SIZES), value="Square", label="Shape")
+                    count = gr.Slider(1, 4, value=1, step=1, label="How many images")
+                    go = gr.Button("Generate", variant="primary", elem_id="go")
+                    with gr.Accordion("More options", open=False):
+                        negative = gr.Textbox(label="Leave out (SD 1.5 models only)", lines=2,
+                                              placeholder="things you don't want in the picture")
+                        model = gr.Dropdown(model_choices(), value=DEFAULT_MODEL, label="Model",
+                                            info="Z-Image follows prompts and writes text best. The SD 1.5 models are "
+                                                 "much faster. Drop SD 1.5 .safetensors files into models\\custom to add your own.")
+                        steps = gr.Slider(10, 50, value=25, step=1, label="Steps (SD 1.5 models only)")
+                        cfg = gr.Slider(1, 15, value=7, step=0.5, label="Prompt strength (SD 1.5 models only)")
+                        seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
+                        with gr.Row():
+                            refresh = gr.Button("Refresh model list", size="sm")
+                            reuse = gr.Button("Reuse last seed", size="sm")
+                with gr.Column(scale=6):
+                    gallery = gr.Gallery(value=recent_images(), label="Results (click one to pick it)", columns=2,
+                                         height=600, object_fit="contain", elem_id="gallery",
+                                         show_download_button=True)
+                    status = gr.Markdown("Ready.")
+                    with gr.Row():
+                        to_edit = gr.Button("Edit this picture", size="sm", variant="secondary")
+                        folder = gr.Button("Open outputs folder", size="sm")
+
+        with gr.Tab("Edit", id="edit"):
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=6):
+                    editor = gr.ImageEditor(
+                        label="Your picture: paint over the part to change", type="pil", height=600,
+                        brush=gr.Brush(colors=["#ff3b7f"], color_mode="fixed", default_size=40),
+                        eraser=gr.Eraser(default_size=40), transforms=(), layers=False,
+                        sources=("upload", "clipboard"))
+                with gr.Column(scale=4, min_width=340):
+                    edit_prompt = gr.Textbox(label="What should it show?", lines=3,
+                                             placeholder="a red leather jacket")
+                    edit_mode = gr.Radio([EDIT_AREA, EDIT_WHOLE], value=EDIT_AREA, label="What to change")
+                    edit_quality = gr.Radio([EDIT_BEST, EDIT_FAST], value=EDIT_BEST, label="Quality")
+                    edit_strength = gr.Slider(0.2, 1.0, value=0.9, step=0.05, label="How much to change",
+                                              info="Low keeps more of the original, high redraws more")
+                    edit_seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
+                    edit_go = gr.Button("Apply edit", variant="primary", elem_id="go2")
+                    edit_result = gr.Image(label="Result", type="filepath", height=420,
+                                           show_download_button=True)
+                    edit_status = gr.Markdown("Upload a picture or send one from the Create tab.")
+                    keep = gr.Button("Keep editing this", size="sm")
 
     last_seed = gr.State(-1)
+    picked = gr.State(None)
     inputs = [prompt, negative, style, size, model, steps, cfg, seed, count]
     go.click(generate, inputs, [gallery, status, last_seed])
     prompt.submit(generate, inputs, [gallery, status, last_seed])
     reuse.click(lambda s: s, last_seed, seed)
     refresh.click(lambda: gr.update(choices=model_choices()), None, model)
     folder.click(open_outputs)
+
+    def pick(evt: gr.SelectData):
+        v = evt.value
+        return v["image"]["path"] if isinstance(v, dict) and "image" in v else v
+
+    def send_to_edit(path):
+        path = path or next(iter(recent_images()), None)
+        if not path:
+            raise gr.Error("Make a picture first.")
+        return {"background": path, "layers": [], "composite": path}, gr.Tabs(selected="edit")
+
+    gallery.select(pick, None, picked)
+    to_edit.click(send_to_edit, picked, [editor, tabs])
+    edit_mode.change(lambda m: 0.9 if m == EDIT_AREA else 0.5, edit_mode, edit_strength)
+    edit_go.click(edit, [editor, edit_prompt, edit_mode, edit_quality, edit_strength, edit_seed],
+                  [edit_result, edit_status])
+    keep.click(lambda p: send_to_edit(p)[0] if p else gr.update(), edit_result, editor)
 
 if __name__ == "__main__":
     demo.queue(max_size=8).launch(server_name="127.0.0.1", inbrowser=True,
