@@ -114,18 +114,30 @@ def _download(url, dest, size, report):
     if dest.exists() and (size is None or dest.stat().st_size == size):
         return
     part = dest.with_name(dest.name + ".part")
-    for _attempt in range(5):
-        have = part.stat().st_size if part.exists() else 0
-        req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+    have = part.stat().st_size if part.exists() else 0
+    failures = 0
+    # Fetch in 32 MB ranges: whole-file requests for multi-GB files can sit at 0 bytes on some PCs.
+    while size is None or have < size:
+        end = have + (32 << 20) - 1 if size is not None else ""
+        req = urllib.request.Request(url, headers={"Range": f"bytes={have}-{end}"})
         try:
-            with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
-                while chunk := r.read(1 << 20):
-                    f.write(chunk)
-                    have += len(chunk)
-                    report(have)
-            break
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if r.status == 200:  # server ignored the range and sent the whole file
+                    have = 0
+                with open(part, "ab" if have else "wb") as f:
+                    while chunk := r.read(1 << 20):
+                        f.write(chunk)
+                        have += len(chunk)
+                        report(have)
+            failures = 0
+            if size is None or r.status == 200:
+                break
         except OSError:
+            failures += 1
+            if failures > 8:
+                break
             time.sleep(3)
+            have = part.stat().st_size if part.exists() else 0
     if size is not None and part.stat().st_size != size:
         raise gr.Error("The model download was interrupted. Check your internet and try again.")
     part.replace(dest)
