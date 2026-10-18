@@ -30,6 +30,20 @@ each PNG.
   To add any Stable Diffusion 1.5 model from Civitai, put its `.safetensors` file
   in `models\custom` and press "Refresh model list".
 
+## Editing a picture
+
+Click a picture on the Create tab, press **Edit this picture**, or upload one on the
+**Edit** tab.
+
+- **Change the painted area**: brush over the part to change, then describe what
+  should be there ("a red leather jacket"). Everything you didn't paint stays exactly
+  as it was.
+- **Vary the whole picture**: redraws everything while keeping the layout. Lower
+  "How much to change" keeps more of the original.
+- **Fast** (about 20 to 30 seconds) is best for painted-area edits. **Best** uses
+  Z-Image (about 2 minutes) and works better when you describe the whole picture.
+- **Keep editing this** sends the result back in, so you can make several edits in a row.
+
 ## About this PC
 
 Built for a GTX 1660 Ti (6 GB). These cards make black images in half precision,
