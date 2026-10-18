@@ -4,6 +4,7 @@ Runs Stable Diffusion 1.5-family models locally with diffusers and a Gradio UI.
 After the first model download, everything works without an internet connection.
 """
 
+import faulthandler
 import gc
 import json
 import os
@@ -19,8 +20,14 @@ ROOT = Path(__file__).resolve().parent
 MODELS_DIR = ROOT / "models"
 CUSTOM_DIR = MODELS_DIR / "custom"
 OUTPUTS_DIR = ROOT / "outputs"
-for d in (MODELS_DIR, CUSTOM_DIR, OUTPUTS_DIR):
+LOGS_DIR = ROOT / "logs"
+for d in (MODELS_DIR, CUSTOM_DIR, OUTPUTS_DIR, LOGS_DIR):
     d.mkdir(parents=True, exist_ok=True)
+# Native crashes (PyTorch, CUDA) kill the process without a Python traceback; keep a record of them.
+_crash_log = open(LOGS_DIR / "crash.log", "a", encoding="utf-8")  # noqa: SIM115
+_crash_log.write(f"\n--- started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+_crash_log.flush()
+faulthandler.enable(file=_crash_log)
 
 os.environ.setdefault("HF_HOME", str(MODELS_DIR / "hf"))
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -206,9 +213,7 @@ def load_pipe(choice, progress):
     if _pipe is not None and _pipe_key == choice:
         return _pipe
     _pipe = None
-    gc.collect()  # free the previous model's RAM before loading the next one
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
+    free_memory()  # release the previous model before loading the next one
     kwargs = dict(torch_dtype=DTYPE, safety_checker=None, feature_extractor=None,
                   requires_safety_checker=False)
     if choice.startswith("Custom: "):
@@ -220,7 +225,7 @@ def load_pipe(choice, progress):
     elif choice == ZIMAGE:
         folder, _ = fetch_model(BUILTIN_MODELS[choice], progress)
         progress(0, desc="Loading model…")
-        _pipe, _pipe_key = load_zimage(folder), choice
+        _pipe, _pipe_key = ZImage(folder), choice
         return _pipe
     else:
         repo = INPAINT_REPO if choice == INPAINT_MODEL else BUILTIN_MODELS[choice]
@@ -237,19 +242,63 @@ def load_pipe(choice, progress):
     return pipe
 
 
-def load_zimage(folder):
-    """Z-Image Turbo in 4-bit: the text encoder and image model take turns on the GPU."""
-    from diffusers import ZImagePipeline
-
-    pipe = ZImagePipeline.from_pretrained(str(folder), torch_dtype=ZDTYPE)
-    for part in (pipe.transformer, pipe.text_encoder):
-        for mod in part.modules():
-            if hasattr(mod, "compute_dtype"):
-                mod.compute_dtype = ZDTYPE
+def free_memory():
+    gc.collect()
     if DEVICE == "cuda":
-        pipe.enable_model_cpu_offload()
-    pipe.set_progress_bar_config(disable=True)
-    return pipe
+        torch.cuda.empty_cache()
+
+
+def _set_compute_dtype(model):
+    for mod in model.modules():
+        if hasattr(mod, "compute_dtype"):
+            mod.compute_dtype = ZDTYPE
+
+
+class ZImage:
+    """Z-Image Turbo in 4-bit on a 6 GB card.
+
+    The text encoder and the image model don't both fit on the GPU, so they take turns.
+    Each one loads straight onto the GPU and is dropped when the other needs the room:
+    moving the 4-bit weights back to RAM (diffusers' CPU offload) crashed PyTorch on a
+    GTX 1660 Ti with an access violation in c10.dll.
+    """
+
+    def __init__(self, folder):
+        self.folder = str(folder)
+        self.denoiser = None
+        self.last = (None, None)  # (prompt, embeddings) so repeat prompts skip the encoder
+
+    def encode(self, prompt):
+        from diffusers import ZImagePipeline
+
+        if self.last[0] == prompt:
+            return self.last[1]
+        self.denoiser = None
+        free_memory()
+        enc = ZImagePipeline.from_pretrained(self.folder, transformer=None, vae=None, torch_dtype=ZDTYPE)
+        _set_compute_dtype(enc.text_encoder)
+        with torch.no_grad():
+            embeds, _ = enc.encode_prompt(prompt, device=DEVICE, do_classifier_free_guidance=False)
+        del enc
+        free_memory()
+        self.last = (prompt, embeds)
+        return embeds
+
+    def pipe(self, cls=None):
+        from diffusers import ZImagePipeline
+
+        if self.denoiser is None:
+            pipe = ZImagePipeline.from_pretrained(self.folder, text_encoder=None, tokenizer=None,
+                                                  torch_dtype=ZDTYPE)
+            _set_compute_dtype(pipe.transformer)
+            pipe.vae.to(DEVICE)
+            pipe.set_progress_bar_config(disable=True)
+            self.denoiser = pipe
+        if cls is None:
+            return self.denoiser
+        derived = cls.from_pipe(self.denoiser)
+        derived.set_progress_bar_config(disable=True)
+        return derived
 
 
 def generate(prompt, negative, style, size, model, steps, cfg, seed, count, progress=gr.Progress()):
@@ -262,6 +311,7 @@ def generate(prompt, negative, style, size, model, steps, cfg, seed, count, prog
     progress(0, desc="Loading model…")
     pipe = load_pipe(model, progress)
     is_z = model == ZIMAGE
+    zimage = pipe if is_z else None
     style_pos, style_neg = STYLES.get(style, ("", ""))
     full_prompt = f"{prompt}, {style_pos}" if style_pos else prompt
     width, height = SIZES[size]["z" if is_z else "sd"]
@@ -273,6 +323,13 @@ def generate(prompt, negative, style, size, model, steps, cfg, seed, count, prog
     base_seed = int(seed) if seed is not None and int(seed) >= 0 else random.randint(0, 2**31 - 1)
 
     images, started = [], time.time()
+    if is_z:
+        progress(0, desc="Reading your prompt…")
+        prompt_args = {"prompt_embeds": zimage.encode(full_prompt)}
+        progress(0, desc="Loading model…")
+        pipe = zimage.pipe()
+    else:
+        prompt_args = {"prompt": full_prompt, "negative_prompt": full_negative}
     for i in range(count):
         s = base_seed + i
 
@@ -281,11 +338,10 @@ def generate(prompt, negative, style, size, model, steps, cfg, seed, count, prog
                      desc=f"Image {i + 1} of {count}, step {step + 1}/{steps}")
             return kw
 
-        extra = {} if is_z else {"negative_prompt": full_negative}
-        img = pipe(full_prompt, width=width, height=height,
+        img = pipe(width=width, height=height,
                    num_inference_steps=steps, guidance_scale=float(cfg),
                    generator=torch.Generator(DEVICE).manual_seed(s),
-                   callback_on_step_end=on_step, **extra).images[0]
+                   callback_on_step_end=on_step, **prompt_args).images[0]
         meta = {"prompt": full_prompt, "negative": full_negative, "seed": s, "steps": steps,
                 "cfg": cfg, "size": f"{width}x{height}", "model": model}
         info = PngInfo()
@@ -346,12 +402,13 @@ def edit(editor, prompt, mode, quality, strength, seed, progress=gr.Progress()):
     if best:
         from diffusers import ZImageImg2ImgPipeline, ZImageInpaintPipeline
 
-        base = load_pipe(ZIMAGE, progress)
+        zimage = load_pipe(ZIMAGE, progress)
         size = fit_size(original, 640 * 640, 16)
-        cls = ZImageInpaintPipeline if mask else ZImageImg2ImgPipeline
-        pipe = cls.from_pipe(base)
-        pipe.set_progress_bar_config(disable=True)
-        args = dict(num_inference_steps=ZIMAGE_STEPS, guidance_scale=0.0)
+        progress(0, desc="Reading your prompt…")
+        args = dict(num_inference_steps=ZIMAGE_STEPS, guidance_scale=0.0,
+                    prompt_embeds=zimage.encode(prompt))
+        progress(0, desc="Loading model…")
+        pipe = zimage.pipe(ZImageInpaintPipeline if mask else ZImageImg2ImgPipeline)
     else:
         size = fit_size(original, 512 * 512, 8)
         if mask:
@@ -359,13 +416,13 @@ def edit(editor, prompt, mode, quality, strength, seed, progress=gr.Progress()):
         else:
             pipe = StableDiffusionImg2ImgPipeline.from_pipe(load_pipe(SD_LAYOUT_MODEL, progress))
             pipe.set_progress_bar_config(disable=True)
-        args = dict(num_inference_steps=30, guidance_scale=7.0, negative_prompt=BASE_NEGATIVE)
+        args = dict(num_inference_steps=30, guidance_scale=7.0, prompt=prompt, negative_prompt=BASE_NEGATIVE)
     progress(0.1, desc="Painting…")
     image_in = original.resize(size, Image.LANCZOS)
     extra = {"mask_image": mask.resize(size, Image.LANCZOS)} if mask else {}
     if best or mask:  # SD img2img takes its size from the input picture instead
         extra.update(width=size[0], height=size[1])
-    out = pipe(prompt, image=image_in, strength=float(strength), generator=gen, **extra, **args).images[0]
+    out = pipe(image=image_in, strength=float(strength), generator=gen, **extra, **args).images[0]
     out = out.resize(original.size, Image.LANCZOS)
     if mask:  # keep every unpainted pixel exactly as it was, with a soft seam
         soft = mask.filter(ImageFilter.MaxFilter(9)).filter(ImageFilter.GaussianBlur(6))
@@ -402,7 +459,25 @@ footer {display: none !important;}
 theme = gr.themes.Soft(primary_hue="violet", secondary_hue="indigo", neutral_hue="slate",
                        font=["Segoe UI", "Inter", "system-ui", "sans-serif"])
 
-FORCE_DARK = """() => { if (!document.body.classList.contains('dark')) document.body.classList.add('dark'); }"""
+# Dark theme, plus a plain-language banner when the app's engine (the black window) stops.
+# The launcher restarts it after a crash, and the page reloads itself once it's back.
+FORCE_DARK = """() => {
+  if (!document.body.classList.contains('dark')) document.body.classList.add('dark');
+  const banner = document.createElement('div');
+  banner.style.cssText = 'display:none;position:fixed;top:0;left:0;right:0;z-index:9999;padding:14px 20px;' +
+    'background:#7c2d12;color:#fff;font:15px Segoe UI,sans-serif;text-align:center';
+  banner.textContent = "Image Machine's engine on this PC stopped. It restarts by itself and this page " +
+    "reloads when it's ready. If the black Image Machine window is closed, open Image Machine from your desktop.";
+  document.body.appendChild(banner);
+  let down = false;
+  setInterval(async () => {
+    try {
+      const r = await fetch(window.location.origin + '/config', {cache: 'no-store'});
+      if (!r.ok) throw new Error();
+      if (down) location.reload();
+    } catch (e) { down = true; banner.style.display = 'block'; }
+  }, 4000);
+}"""
 
 with gr.Blocks(title="Image Machine", theme=theme, css=CSS, js=FORCE_DARK) as demo:
     gr.Markdown("# Image Machine", elem_id="title")
@@ -490,5 +565,6 @@ with gr.Blocks(title="Image Machine", theme=theme, css=CSS, js=FORCE_DARK) as de
     keep.click(lambda p: send_to_edit(p)[0] if p else gr.update(), edit_result, editor)
 
 if __name__ == "__main__":
-    demo.queue(max_size=8).launch(server_name="127.0.0.1", inbrowser=True,
+    # After an automatic restart the browser tab is already open, so don't open another.
+    demo.queue(max_size=8).launch(server_name="127.0.0.1", inbrowser=not os.environ.get("IM_RESTARTED"),
                                   allowed_paths=[str(OUTPUTS_DIR)])

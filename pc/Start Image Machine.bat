@@ -7,6 +7,7 @@ set "UV_CACHE_DIR=%~dp0tools\cache"
 set "UV_PYTHON_INSTALL_DIR=%~dp0tools\python"
 set "UV_NO_MODIFY_PATH=1"
 set "UV=%~dp0tools\uv.exe"
+set TRIES=0
 
 if exist ".venv\installed.txt" goto run
 
@@ -28,8 +29,14 @@ echo  Starting Image Machine. Your browser will open in a moment.
 echo  Keep this window open while you use it; close it to quit.
 echo.
 ".venv\Scripts\python.exe" app.py
-if errorlevel 1 goto fail
-goto :eof
+if not errorlevel 1 goto :eof
+set /a TRIES+=1
+if %TRIES% gtr 5 goto fail
+echo.
+echo  The image engine stopped unexpectedly. Restarting it in a few seconds...
+set "IM_RESTARTED=1"
+timeout /t 3 /nobreak >nul
+goto run
 
 :fail
 echo.
