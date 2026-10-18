@@ -1,5 +1,6 @@
-diffusers>=0.31,<1
+diffusers>=0.36,<1
 transformers>=4.44,<5
 accelerate>=0.33
 safetensors
 gradio>=5.9,<6
+bitsandbytes>=0.45

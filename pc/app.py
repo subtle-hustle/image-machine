@@ -31,19 +31,25 @@ import torch  # noqa: E402
 from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline  # noqa: E402
 from PIL.PngImagePlugin import PngInfo  # noqa: E402
 
+ZIMAGE = "Z-Image Turbo (best quality, slower)"
 BUILTIN_MODELS = {
+    ZIMAGE: "unsloth/Z-Image-Turbo-unsloth-bnb-4bit",
     "DreamShaper 8 (all-rounder)": "Lykon/dreamshaper-8",
     "Realistic Vision 5.1 (photos)": "SG161222/Realistic_Vision_V5.1_noVAE",
     "Stable Diffusion 1.5 (original)": "stable-diffusion-v1-5/stable-diffusion-v1-5",
 }
-DEFAULT_MODEL = "DreamShaper 8 (all-rounder)"
+DEFAULT_MODEL = ZIMAGE
+SD_LAYOUT_MODEL = "DreamShaper 8 (all-rounder)"
+ZIMAGE_STEPS = 8
 
+# Pixel sizes per shape. Z-Image gets a little more room; every shape costs about
+# the same time (roughly 1.5 to 2 minutes per picture on a GTX 1660 Ti).
 SIZES = {
-    "Square 512×512": (512, 512),
-    "Portrait 512×768": (512, 768),
-    "Landscape 768×512": (768, 512),
-    "Tall 448×832": (448, 832),
-    "Wide 832×448": (832, 448),
+    "Square": {"sd": (512, 512), "z": (640, 640)},
+    "Portrait": {"sd": (512, 768), "z": (512, 768)},
+    "Landscape": {"sd": (768, 512), "z": (768, 512)},
+    "Tall": {"sd": (448, 832), "z": (448, 832)},
+    "Wide": {"sd": (832, 448), "z": (832, 448)},
 }
 
 STYLES = {
@@ -65,7 +71,7 @@ STYLES = {
 }
 
 BASE_NEGATIVE = ("lowres, blurry, worst quality, low quality, jpeg artifacts, deformed, "
-                 "bad anatomy, extra fingers, extra limbs, watermark, text, signature")
+                 "bad anatomy, extra fingers, extra limbs, watermark, signature")
 
 # The model's built-in safety checker is off. This one guard stays: sexual
 # content involving minors is illegal everywhere and is never generated.
@@ -90,6 +96,9 @@ def pick_device():
 
 
 DEVICE, DTYPE, DEVICE_LABEL = pick_device()
+# Z-Image overflows in fp16, and on GTX 16xx cards fp16 matmuls are slower than fp32 anyway.
+ZDTYPE = torch.bfloat16 if DEVICE == "cuda" and torch.cuda.is_bf16_supported(including_emulation=False) \
+    else torch.float32
 _pipe = None
 _pipe_key = None
 
@@ -194,9 +203,14 @@ def load_pipe(choice, progress):
     if choice.startswith("Custom: "):
         path = CUSTOM_DIR / choice[len("Custom: "):]
         # Single-file checkpoints borrow their layout from DreamShaper, so they also load offline.
-        folder, _ = fetch_model(BUILTIN_MODELS[DEFAULT_MODEL], progress)
+        folder, _ = fetch_model(BUILTIN_MODELS[SD_LAYOUT_MODEL], progress)
         progress(0, desc="Loading model…")
         pipe = StableDiffusionPipeline.from_single_file(str(path), config=str(folder), **kwargs)
+    elif choice == ZIMAGE:
+        folder, _ = fetch_model(BUILTIN_MODELS[choice], progress)
+        progress(0, desc="Loading model…")
+        _pipe, _pipe_key = load_zimage(folder), choice
+        return _pipe
     else:
         folder, variant = fetch_model(BUILTIN_MODELS[choice], progress)
         progress(0, desc="Loading model…")
@@ -210,6 +224,21 @@ def load_pipe(choice, progress):
     return pipe
 
 
+def load_zimage(folder):
+    """Z-Image Turbo in 4-bit: the text encoder and image model take turns on the GPU."""
+    from diffusers import ZImagePipeline
+
+    pipe = ZImagePipeline.from_pretrained(str(folder), torch_dtype=ZDTYPE)
+    for part in (pipe.transformer, pipe.text_encoder):
+        for mod in part.modules():
+            if hasattr(mod, "compute_dtype"):
+                mod.compute_dtype = ZDTYPE
+    if DEVICE == "cuda":
+        pipe.enable_model_cpu_offload()
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
 def generate(prompt, negative, style, size, model, steps, cfg, seed, count, progress=gr.Progress()):
     prompt = (prompt or "").strip()
     if not prompt:
@@ -219,11 +248,15 @@ def generate(prompt, negative, style, size, model, steps, cfg, seed, count, prog
 
     progress(0, desc="Loading model…")
     pipe = load_pipe(model, progress)
+    is_z = model == ZIMAGE
     style_pos, style_neg = STYLES.get(style, ("", ""))
     full_prompt = f"{prompt}, {style_pos}" if style_pos else prompt
-    full_negative = ", ".join(x for x in (negative.strip(), style_neg, BASE_NEGATIVE) if x)
-    width, height = SIZES[size]
+    width, height = SIZES[size]["z" if is_z else "sd"]
     steps, count = int(steps), int(count)
+    if is_z:  # a distilled model: fixed short schedule, no negative prompt
+        full_negative, steps, cfg = "", ZIMAGE_STEPS, 0.0
+    else:
+        full_negative = ", ".join(x for x in (negative.strip(), style_neg, BASE_NEGATIVE) if x)
     base_seed = int(seed) if seed is not None and int(seed) >= 0 else random.randint(0, 2**31 - 1)
 
     images, started = [], time.time()
@@ -235,10 +268,11 @@ def generate(prompt, negative, style, size, model, steps, cfg, seed, count, prog
                      desc=f"Image {i + 1} of {count}, step {step + 1}/{steps}")
             return kw
 
-        img = pipe(full_prompt, negative_prompt=full_negative, width=width, height=height,
+        extra = {} if is_z else {"negative_prompt": full_negative}
+        img = pipe(full_prompt, width=width, height=height,
                    num_inference_steps=steps, guidance_scale=float(cfg),
                    generator=torch.Generator(DEVICE).manual_seed(s),
-                   callback_on_step_end=on_step).images[0]
+                   callback_on_step_end=on_step, **extra).images[0]
         meta = {"prompt": full_prompt, "negative": full_negative, "seed": s, "steps": steps,
                 "cfg": cfg, "size": f"{width}x{height}", "model": model}
         info = PngInfo()
@@ -289,16 +323,17 @@ with gr.Blocks(title="Image Machine", theme=theme, css=CSS, js=FORCE_DARK) as de
                                 placeholder="A lighthouse on a cliff at sunset, crashing waves, golden light")
             with gr.Row():
                 style = gr.Dropdown(list(STYLES), value="None", label="Style")
-                size = gr.Dropdown(list(SIZES), value="Square 512×512", label="Shape")
+                size = gr.Dropdown(list(SIZES), value="Square", label="Shape")
             count = gr.Slider(1, 4, value=1, step=1, label="How many images")
             go = gr.Button("Generate", variant="primary", elem_id="go")
             with gr.Accordion("More options", open=False):
-                negative = gr.Textbox(label="Leave out (negative prompt)", lines=2,
+                negative = gr.Textbox(label="Leave out (SD 1.5 models only)", lines=2,
                                       placeholder="things you don't want in the picture")
                 model = gr.Dropdown(model_choices(), value=DEFAULT_MODEL, label="Model",
-                                    info="Drop .safetensors files into models\\custom to add your own")
-                steps = gr.Slider(10, 50, value=25, step=1, label="Steps (more = slower, finer)")
-                cfg = gr.Slider(1, 15, value=7, step=0.5, label="Prompt strength")
+                                    info="Z-Image follows prompts and writes text best. The SD 1.5 models are "
+                                         "much faster. Drop SD 1.5 .safetensors files into models\\custom to add your own.")
+                steps = gr.Slider(10, 50, value=25, step=1, label="Steps (SD 1.5 models only)")
+                cfg = gr.Slider(1, 15, value=7, step=0.5, label="Prompt strength (SD 1.5 models only)")
                 seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
                 with gr.Row():
                     refresh = gr.Button("Refresh model list", size="sm")
