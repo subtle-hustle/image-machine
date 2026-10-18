@@ -246,6 +246,7 @@ def free_memory():
     gc.collect()
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
+        print(f"[memory] GPU in use after cleanup: {torch.cuda.memory_allocated() >> 20} MB", flush=True)
 
 
 def _set_compute_dtype(model):
