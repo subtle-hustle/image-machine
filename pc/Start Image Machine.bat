@@ -29,7 +29,8 @@ echo  Starting Image Machine. Your browser will open in a moment.
 echo  Keep this window open while you use it; close it to quit.
 echo.
 ".venv\Scripts\python.exe" app.py
-if not errorlevel 1 goto :eof
+rem A crash exits with a negative code (0xC0000005), which "if errorlevel 1" misses.
+if "%ERRORLEVEL%"=="0" goto :eof
 set /a TRIES+=1
 if %TRIES% gtr 5 goto fail
 echo.
